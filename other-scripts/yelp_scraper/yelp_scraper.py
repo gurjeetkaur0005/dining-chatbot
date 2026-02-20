@@ -2,11 +2,15 @@ import requests
 import json
 from datetime import datetime
 import time
+from dotenv import load_dotenv
+import os
 
-API_KEY = "YOUR_YELP_API_KEY"
+# Load API key from .env
+load_dotenv()
+API_KEY = os.getenv("YELP_API_KEY")
 HEADERS = {"Authorization": f"Bearer {API_KEY}"}
-BASE_URL = "https://api.yelp.com/v3/businesses/search"
 
+BASE_URL = "https://api.yelp.com/v3/businesses/search"
 CUISINES = ["Italian", "Chinese", "Mexican", "Indian", "Japanese"]
 LOCATION = "Manhattan, NY"
 LIMIT_PER_CUISINE = 200
@@ -18,7 +22,7 @@ def fetch_restaurants(cuisine, location=LOCATION, limit=LIMIT_PER_CUISINE):
     offset = 0
     while len(restaurants) < limit:
         params = {
-            "term": cuisine + " restaurant",
+            "term": f"{cuisine} restaurant",
             "location": location,
             "limit": 50,  # max per request
             "offset": offset
@@ -40,16 +44,14 @@ def fetch_restaurants(cuisine, location=LOCATION, limit=LIMIT_PER_CUISINE):
                 "insertedAtTimestamp": datetime.utcnow().isoformat()
             })
         offset += 50
-        time.sleep(1)  # avoid hitting rate limits
+        time.sleep(1)
     return restaurants[:limit]
 
-# Fetch data for all cuisines
 for cuisine in CUISINES:
     print(f"Fetching {cuisine} restaurants...")
-    fetched = fetch_restaurants(cuisine)
-    all_restaurants.extend(fetched)
+    all_restaurants.extend(fetch_restaurants(cuisine))
 
-# Save to JSON
+# Save data to JSON
 with open("yelp_data.json", "w") as f:
     json.dump(all_restaurants, f, indent=2)
 
