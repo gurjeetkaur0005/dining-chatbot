@@ -34,15 +34,16 @@ def fetch_restaurants(cuisine, location=LOCATION, limit=LIMIT_PER_CUISINE):
             break
         for b in businesses:
             restaurants.append({
-                "business_id": b["id"],
-                "name": b["name"],
-                "address": " ".join(b["location"]["display_address"]),
-                "coordinates": b["coordinates"],
-                "reviews": b.get("review_count", 0),
-                "rating": b.get("rating", 0),
-                "zip": b["location"].get("zip_code", ""),
-                "insertedAtTimestamp": datetime.utcnow().isoformat()
-            })
+                    "business_id": b["id"],
+                    "name": b["name"],
+                    "cuisine": cuisine,  # <-- Add cuisine here
+                    "address": " ".join(b["location"]["display_address"]),
+                    "coordinates": b["coordinates"],
+                    "reviews": b.get("review_count", 0),
+                    "rating": b.get("rating", 0),
+                    "zip": b["location"].get("zip_code", ""),
+                    "insertedAtTimestamp": datetime.utcnow().isoformat()
+                })
         offset += 50
         time.sleep(1)
     return restaurants[:limit]
@@ -56,3 +57,4 @@ with open("yelp_data.json", "w") as f:
     json.dump(all_restaurants, f, indent=2)
 
 print(f"Saved {len(all_restaurants)} restaurants to yelp_data.json")
+
