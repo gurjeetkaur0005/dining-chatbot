@@ -2,50 +2,73 @@ import json
 import os
 import boto3
 from botocore.exceptions import ClientError
-from datetime import datetime
 
+# ---------- AWS Clients ----------
 dynamodb = boto3.resource("dynamodb")
 sqs = boto3.client("sqs")
 
+# ---------- Environment ----------
 STATE_TABLE = os.getenv("STATE_TABLE", "user-state")
 QUEUE_URL = os.getenv("QUEUE_URL")
 
 state_table = dynamodb.Table(STATE_TABLE)
 
+# ---------- Lambda Handler ----------
 def lambda_handler(event, context):
-    # Accept either userId or email
+
+    # Accept userId or email
     user_id = event.get("userId") or event.get("email")
+
     if not user_id:
-        return {"statusCode": 400, "body": json.dumps("Missing userId/email")}
+        return {
+            "statusCode": 400,
+            "body": json.dumps("Missing userId/email")
+        }
 
     if not QUEUE_URL:
-        return {"statusCode": 500, "body": json.dumps("Missing QUEUE_URL env var")}
+        return {
+            "statusCode": 500,
+            "body": json.dumps("Missing QUEUE_URL env var")
+        }
 
     try:
-        # Read last saved state
         resp = state_table.get_item(Key={"userId": user_id})
         item = resp.get("Item")
-        if not item:
-            return {"statusCode": 404, "body": json.dumps("No saved state found for this user")}
 
-        now = datetime.now()
+        if not item:
+            return {
+                "statusCode": 404,
+                "body": json.dumps("No saved state found for this user")
+            }
+
+        last_cuisine = item.get("lastCuisine", "Indian")
+        last_location = item.get("lastLocation", "Manhattan")
+
 
         payload = {
             "email": user_id,
-            "location": item.get("lastLocation", "Manhattan"),
-            "cuisine": item.get("lastCuisine", "Indian"),
-            "date": now.strftime("%B %d, %Y"),  # e.g., February 27, 2026
-            "time": now.strftime("%I:%M %p"),   # e.g., 02:35 PM
-            "party_size": "2"
+            "location": last_location,
+            "cuisine": last_cuisine,
+            "previous_search": True
         }
 
-        # Send to Q1 (LF2 will process)
+
         sqs.send_message(
             QueueUrl=QUEUE_URL,
             MessageBody=json.dumps(payload)
         )
 
-        return {"statusCode": 200, "body": json.dumps({"sentToQueue": True, "payload": payload})}
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "sentToQueue": True,
+                "message": "Recommendation request based on previous search sent successfully",
+                "payload": payload
+            })
+        }
 
     except ClientError as e:
-        return {"statusCode": 500, "body": json.dumps(str(e))}
+        return {
+            "statusCode": 500,
+            "body": json.dumps(str(e))
+        }
