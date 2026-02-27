@@ -1,214 +1,281 @@
-# LF2 — Dining Concierge Worker Lambda
+# LF2 — Dining Concierge Worker (SQS → OpenSearch/DynamoDB → SES)
 
-LF2 is the **worker Lambda** in the Dining Concierge pipeline. It consumes requests from **SQS (Q1)**, fetches restaurant suggestions from **OpenSearch** (or DynamoDB fallback), pulls full restaurant details from **DynamoDB**, and sends the final recommendations to the user via **Amazon SES**.
+This repository contains **LF2**, the *worker Lambda* for the NYU Dining Concierge system.
 
----
+LF2 consumes dining requests from **SQS (Q1)**, fetches restaurant IDs from **OpenSearch**, loads full restaurant details from **DynamoDB**, and sends recommendations to the user via **Amazon SES**.
 
-## What LF2 Does (End-to-End)
-
-1. **Triggered by SQS** (and optionally by an EventBridge schedule that “pokes” the queue).
-2. Reads 1+ messages from **Q1**.
-3. For each message, extracts:
-   - `cuisine`, `location`, `date`, `time`, `partySize`, `email`
-4. Finds candidate restaurants:
-   - **Primary**: query **OpenSearch** for the given cuisine (randomized selection)
-   - **Fallback**: query **DynamoDB** by cuisine if OpenSearch is not available
-5. Loads full restaurant records from **DynamoDB** (`yelp-restaurants`).
-6. Formats a friendly email body with **3 restaurant recommendations**.
-7. Sends the email using **SES**.
-8. Deletes the message from SQS only after success (so failed messages can retry).
+> ✅ **Public repo safe:** This README uses **placeholders only**. Do **NOT** commit real emails, endpoints, usernames, or passwords. Store them in **Lambda environment variables**.
 
 ---
 
-## Repository Location
+## Architecture Context
 
-Recommended folder structure:
+S3 (Frontend) → API Gateway → LF0 → Lex → LF1 → **SQS (Q1)** → **LF2** → OpenSearch + DynamoDB → SES (Email)
+
+LF2 is responsible for the highlighted section.
+
+---
+
+## What LF2 Does
+
+For each SQS message:
+
+1. **Dedupes** the message using a DynamoDB table (`lf2-processed`) *(optional but recommended)*.
+2. Parses the JSON payload (location/cuisine/date/time/party size/email).
+3. Queries **OpenSearch** for restaurant IDs matching the cuisine.
+4. Picks up to **3 random restaurants**.
+5. Batch-gets full details from **DynamoDB** (`yelp-restaurants`).
+6. Formats an email body and sends it via **SES**.
+7. Saves the user’s last search state to DynamoDB (`user-state`) *(optional/extra credit)*.
+8. Marks the message as processed.
+
+---
+
+## Repo Structure (Suggested)
 
 ```
 lambda-functions/
   LF2/
     lambda_function.py
-    requirements.txt
     README.md
 ```
 
 ---
 
-## AWS Resources LF2 Depends On
+## Input: SQS Message Format
 
-### 1) SQS
-- Queue name: `Q1`
+LF2 expects the **SQS message body** to be JSON.
 
-LF2 receives messages in this queue and deletes them after processing.
-
-### 2) DynamoDB
-- Table name: `yelp-restaurants`
-- Partition key: `business_id` (String)
-
-**Minimum attributes to store per restaurant**
-- `business_id` (PK)
-- `name`
-- `address`
-- `coordinates` (optional)
-- `rating`
-- `review_count` (or `reviews`)
-- `zip`
-- `cuisine`
-- `insertedAtTimestamp`
-
-### 3) OpenSearch (Create LAST — cost risk)
-- Domain endpoint: `https://...es.amazonaws.com` (or OpenSearch endpoint)
-- Index: `restaurants`
-
-**Suggested indexed fields**
-- `RestaurantID` (same as Yelp `business_id`)
-- `Cuisine`
-
-LF2 queries OpenSearch by cuisine and then uses returned IDs to fetch details from DynamoDB.
-
-### 4) Amazon SES
-- Sender email must be **verified in SES**
-- In SES Sandbox: recipient emails must also be verified (unless you request production access)
-
----
-
-## Message Format in Q1
-
-LF2 expects the SQS message body to be JSON, for example:
-
+### Example
 ```json
 {
-  "location": "Manhattan",
+  "email": "recipient@example.com",
   "cuisine": "Indian",
+  "location": "Manhattan",
   "date": "2026-03-01",
   "time": "19:00",
-  "partySize": "2",
-  "email": "someone@example.com"
+  "party_size": "2",
+  "previous_search": false
 }
 ```
 
-> If your LF1 uses a different key naming, update LF2 parsing accordingly.
+### Supported Keys
+- `email` *(required)* — recipient email address
+- `cuisine` *(optional)* — defaults to `"Indian"`
+- `location` *(optional)* — defaults to `"Manhattan"`
+- `date` *(optional)* — defaults to `"Today"`
+- `time` *(optional)* — defaults to `"7 PM"`
+- `party_size` *(optional)* — defaults to `"2"`
+- `previous_search` *(optional boolean)* — changes email wording
+
+> If your LF1 uses different key names, update LF2’s parsing accordingly.
 
 ---
 
-## Environment Variables
+## DynamoDB Tables
 
-Set these on the LF2 Lambda configuration:
+### 1) Restaurants Table (required)
+- **Table name:** `yelp-restaurants` *(default via `TABLE_NAME`)*
+- **Partition key:** `business_id` (String)
 
-| Name | Example | Required | Notes |
-|------|---------|----------|------|
-| `TABLE_NAME` | `yelp-restaurants` | ✅ | DynamoDB table |
-| `SENDER_EMAIL` | `your-verified-sender@domain.com` | ✅ | Verified in SES |
-| `OPENSEARCH_ENDPOINT` | `https://search-xxxx.us-east-1.es.amazonaws.com` | Optional | If missing, LF2 uses DynamoDB fallback |
-| `OPENSEARCH_INDEX` | `restaurants` | Optional | Default: restaurants |
-| `OS_MASTER_USER` | `admin` | Optional | Only if using basic auth |
-| `OS_MASTER_PASSWORD` | `...` | Optional | Only if using basic auth |
-| `AWS_REGION` | `us-east-1` | Optional | Defaults to Lambda region |
+**Minimum attributes recommended per item**
+- `business_id` (String) — Yelp business id (PK)
+- `name` (String)
+- `address` (String)
+- `rating` (Number)
+- `reviews` (Number) *(or rename in code if your table uses `review_count`)*
+- `zip` (String) *(optional)*
+- `cuisine` (String) *(recommended for fallback/querying)*
+- `insertedAtTimestamp` (String)
+
+LF2 currently batch-reads these attributes:
+- `name`, `address`, `rating`, `reviews`
+
+So make sure those fields exist in DynamoDB (or adjust `ddb_batch_get_by_ids()`).
+
+### 2) Processed Messages Table (optional, recommended)
+- **Table name:** `lf2-processed` *(default via `PROCESSED_TABLE`)*
+- **Partition key:** `messageId` (String)
+
+Used to avoid duplicate emails when Lambda retries.
+
+### 3) State Memory Table (optional / extra credit)
+- **Table name:** `user-state` *(default via `STATE_TABLE`)*
+- **Partition key:** `userId` (String)
+
+Stores:
+- `lastCuisine`, `lastLocation`, `updatedAt`
+
+---
+
+## OpenSearch Setup (Create LAST — Cost Risk)
+
+- **Endpoint:** set via `OPENSEARCH_ENDPOINT`
+- **Index:** `restaurants` *(default via `OPENSEARCH_INDEX`)*
+
+LF2 queries by cuisine using:
+- `term` query on field `Cuisine`
+- returns `_source.RestaurantID`
+
+### Expected Document Shape
+```json
+{
+  "RestaurantID": "some-yelp-business-id",
+  "Cuisine": "Indian"
+}
+```
+
+> **Important:** `term` queries are case-sensitive depending on mapping. Keep cuisine values consistent (e.g., Title Case) or use a keyword field.
+
+### Auth
+This implementation uses **Basic Auth** via:
+- `OS_MASTER_USER`
+- `OS_MASTER_PASS`
+
+If your domain uses IAM SigV4 instead, you must replace the OpenSearch request signing logic.
+
+---
+
+## Environment Variables (Lambda Configuration)
+
+Set these in **AWS Lambda → Configuration → Environment variables**.
+
+| Variable | Example (placeholder) | Required | Notes |
+|---|---|---:|---|
+| `TABLE_NAME` | `yelp-restaurants` | ✅ | Restaurants DynamoDB table |
+| `SENDER_EMAIL` | `verified-sender@example.com` | ✅ | Must be verified in SES |
+| `PROCESSED_TABLE` | `lf2-processed` | Optional | Dedupe table |
+| `STATE_TABLE` | `user-state` | Optional | State memory table |
+| `MAX_SCAN_ITEMS` | `300` | Optional | Reserved for fallback patterns |
+| `OPENSEARCH_ENDPOINT` | `https://search-xxxx.us-east-1.es.amazonaws.com` | ✅* | Required if using OpenSearch |
+| `OPENSEARCH_INDEX` | `restaurants` | Optional | Default: `restaurants` |
+| `OS_MASTER_USER` | `admin` | ✅* | Required if using Basic Auth |
+| `OS_MASTER_PASS` | `change-me` | ✅* | Required if using Basic Auth |
+
+\* Required only if you are using OpenSearch in LF2.
 
 ---
 
 ## IAM Permissions (LF2 Execution Role)
 
-Attach a policy that allows:
+Attach permissions for:
 
-### SQS
+### SQS (needed when triggered by SQS)
 - `sqs:ReceiveMessage`
 - `sqs:DeleteMessage`
 - `sqs:GetQueueAttributes`
 - `sqs:ChangeMessageVisibility`
 
-### DynamoDB
+### DynamoDB (required)
 - `dynamodb:GetItem`
 - `dynamodb:BatchGetItem`
-- `dynamodb:Query`
-- `dynamodb:Scan` *(avoid if you can, but OK for fallback/testing)*
+- `dynamodb:PutItem` *(for processed/state tables)*
+- `dynamodb:UpdateItem` *(optional)*
+- `dynamodb:Query` *(optional)*
+- `dynamodb:Scan` *(optional; avoid in production)*
 
-### SES
+### SES (required)
 - `ses:SendEmail`
 - `ses:SendRawEmail`
 
-### OpenSearch (if used)
+### OpenSearch (required if using OpenSearch)
 - `es:ESHttpGet`
 - `es:ESHttpPost`
 
-> In class projects, you can scope resources to your specific Queue ARN, Table ARN, SES identity ARN, and OpenSearch domain ARN.
+> Best practice: scope resources to your specific Queue ARN, Table ARNs, SES identity, and OpenSearch domain.
 
 ---
 
-## Deploying LF2
+## SES Notes (Common Gotcha)
 
-### Option A — Zip upload (simple)
-1. Put your code in `lambda_function.py`
-2. If dependencies are needed (e.g., `urllib3` is already available; `requests` usually is not), package them:
-   - `pip install -r requirements.txt -t .`
-   - zip the folder and upload to Lambda
+If SES is in **Sandbox**:
+- The **sender** must be verified.
+- The **recipient** must also be verified.
 
-### Option B — Container image (advanced)
-Not required for the assignment unless your team chose containers.
+Move out of sandbox if your class allows it; otherwise verify both emails.
 
 ---
 
-## Testing LF2
+## Deploy & Test
 
-### 1) Send a test message into Q1
-Using AWS Console → SQS → Send and receive messages:
+### 1) Upload code
+Upload `lambda_function.py` to the LF2 Lambda.
+
+### 2) Configure trigger
+Add **SQS trigger** to LF2:
+- queue: `Q1`
+
+### 3) Send a test message to Q1
+Use SQS Console → *Send and receive messages*:
 
 ```json
-{"location":"Manhattan","cuisine":"Chinese","date":"2026-03-01","time":"19:00","partySize":"4","email":"you@example.com"}
+{"email":"recipient@example.com","cuisine":"Chinese","location":"Manhattan","date":"Today","time":"7 PM","party_size":"4"}
 ```
 
-### 2) Invoke LF2
-If LF2 is configured as an SQS trigger, it will run automatically.
-
-### 3) Check logs
-CloudWatch Logs → Log group for LF2
-
-Look for:
-- message received
-- restaurants selected
-- SES send response
-- message deleted
+### 4) Verify logs
+Check **CloudWatch Logs** for:
+- message parsed
+- OpenSearch hits returned
+- DynamoDB batch-get results
+- SES send success
 
 ---
 
-## Common Issues & Fixes
+## Public Repo Safety Checklist ✅
 
-### SES: “Email address not verified”
-- Verify `SENDER_EMAIL` in SES
-- If SES is in sandbox, verify the recipient email too
+- [ ] No real `SENDER_EMAIL` committed
+- [ ] No `OPENSEARCH_ENDPOINT` committed
+- [ ] No `OS_MASTER_USER/OS_MASTER_PASS` committed
+- [ ] `.env` is gitignored
+- [ ] README uses placeholders only
+
+### Recommended Files
+
+Create `.env.example` (safe to commit):
+```env
+TABLE_NAME=yelp-restaurants
+SENDER_EMAIL=verified-sender@example.com
+PROCESSED_TABLE=lf2-processed
+STATE_TABLE=user-state
+OPENSEARCH_ENDPOINT=https://search-xxxx.us-east-1.es.amazonaws.com
+OPENSEARCH_INDEX=restaurants
+OS_MASTER_USER=admin
+OS_MASTER_PASS=change-me
+```
+
+Add to `.gitignore`:
+```gitignore
+.env
+*.pem
+*.key
+```
+
+---
+
+## Troubleshooting
+
+### “Email address not verified”
+- Verify sender in SES
+- If sandbox, verify recipient too
 
 ### SQS trigger not firing
-- Confirm Lambda trigger is attached to Q1
-- Check Lambda has permissions to read SQS
-- Ensure messages are visible (not stuck due to visibility timeout)
+- Confirm trigger is attached to LF2
+- Confirm LF2 role has SQS permissions
+- Confirm messages are visible (not stuck due to visibility timeout)
 
-### OpenSearch 403 / auth failures
-- If using fine-grained access control, confirm master user/pass
-- Ensure LF2 role can access domain OR use signed requests (IAM-based)
-- Confirm endpoint includes `https://`
+### OpenSearch errors (401/403)
+- Check endpoint starts with `https://`
+- Check Basic Auth vars are set
+- Ensure OpenSearch security is configured to allow that user
+- Confirm index name matches `OPENSEARCH_INDEX`
 
-### DynamoDB empty results
-- Confirm `TABLE_NAME`
-- Confirm items exist (scan table in console)
-- Confirm cuisine values match your query exactly (case/spacing)
-
----
-
-## Cost Safety Notes (Important)
-
-- **Create OpenSearch last** and delete after demo.
-- Keep domain minimal: **1 data node, t3.small.search, 1-AZ dev/test**.
-- Don’t enable standby nodes or multi-AZ.
+### DynamoDB KeyError (missing fields)
+If you see KeyError for `name/address/rating/reviews`, your table schema differs.
+Update `ddb_batch_get_by_ids()` to match your stored attribute names.
 
 ---
 
-## Done Checklist
+## Cost Note (Important)
 
-- [ ] Q1 exists and has messages arriving from LF1
-- [ ] `yelp-restaurants` is populated (1000+ items, 5 cuisines)
-- [ ] LF2 has environment variables set
-- [ ] LF2 IAM role has SQS + DynamoDB + SES permissions
-- [ ] SES sender verified (recipient verified if sandbox)
-- [ ] LF2 sends email and deletes SQS message
-- [ ] OpenSearch created last (optional but required by assignment spec)
-
+**Create OpenSearch LAST** and delete it after the demo to avoid ongoing charges.
+Use minimal settings (single node, dev/test, single AZ) per assignment guidance.
