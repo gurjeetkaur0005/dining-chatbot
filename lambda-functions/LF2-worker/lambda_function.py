@@ -11,15 +11,14 @@ from boto3.dynamodb.conditions import Attr
 
 # ---------- Environment ----------
 TABLE_NAME = os.getenv("TABLE_NAME", "yelp-restaurants")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")  # must be verified in SES
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")  
 
 PROCESSED_TABLE = os.getenv("PROCESSED_TABLE", "lf2-processed")  # dedupe table
 MAX_SCAN_ITEMS = int(os.getenv("MAX_SCAN_ITEMS", "300"))  # fallback only
 
-# ✅ Extra credit state memory table
 STATE_TABLE = os.getenv("STATE_TABLE", "user-state")  # stores lastCuisine + lastLocation for userId=email
 
-OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")  # https://...es.amazonaws.com
+OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")  
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "restaurants")
 OS_MASTER_USER = os.getenv("OS_MASTER_USER")
 OS_MASTER_PASS = os.getenv("OS_MASTER_PASS")
@@ -51,7 +50,6 @@ def parse_record_body(record):
     except json.JSONDecodeError:
         obj = {}
 
-    # Sometimes LF1 wraps payload inside {"body": "..."}
     if isinstance(obj, dict) and "body" in obj:
         inner = obj.get("body")
         if isinstance(inner, str):
@@ -108,7 +106,7 @@ def mark_processed(message_id: str):
         if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
             print("Dedupe put_item failed:", e)
 
-# ---------- State Memory (Extra Credit) ----------
+# ---------- State Memory  ----------
 def save_user_state(email: str, cuisine: str, location: str):
     """
     Saves last search (cuisine + location) for returning user.
@@ -159,7 +157,7 @@ def os_search_ids_by_cuisine(cuisine_value: str, pool_size: int = 50):
         raise RuntimeError("Missing OS_MASTER_USER / OS_MASTER_PASS env vars.")
 
     url = f"{OPENSEARCH_ENDPOINT}/{OPENSEARCH_INDEX}/_search"
-    # ✅ Cuisine is mapped as keyword already, so use Cuisine (no .keyword)
+    # ✅ Cuisine is mapped as keyword already
     query = {
         "size": pool_size,
         "_source": ["RestaurantID", "Cuisine"],
@@ -330,7 +328,6 @@ def lambda_handler(event, context):
             send_email(email, subject, body_text)
             print(f"Email sent to {email} for messageId={message_id}")
 
-            # ✅ Save state memory for extra credit
             save_user_state(email=email, cuisine=display_cuisine, location=location)
 
             if message_id != "unknown":
@@ -341,3 +338,4 @@ def lambda_handler(event, context):
             raise
 
     return {"statusCode": 200, "body": json.dumps("LF2 processed")}
+
