@@ -21,7 +21,7 @@ def convert_numbers(item):
 uploaded_count = 0
 with table.batch_writer() as batch:
     for i, restaurant in enumerate(data, 1):
-        if 'business_id' not in restaurant:  # Use business_id as primary key
+        if 'business_id' not in restaurant:  # business_id is primary key
             print(f"Skipping item {i}: missing business_id")
             continue
         batch.put_item(Item=convert_numbers(restaurant))
