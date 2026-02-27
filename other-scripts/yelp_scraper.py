@@ -24,8 +24,8 @@ ZIP_CODES = [
     "10023", "10025", "10026", "10028", "10029", "10036"
 ]
 
-LIMIT_PER_REQUEST = 50  # Max per Yelp request
-TARGET_PER_CUISINE = 200  # Number of unique restaurants per cuisine
+LIMIT_PER_REQUEST = 50  
+TARGET_PER_CUISINE = 200  
 
 all_restaurants = []
 seen_business_ids = set()
@@ -67,11 +67,10 @@ def fetch_restaurants(cuisine, zip_code):
                 break
 
         offset += LIMIT_PER_REQUEST
-        time.sleep(0.5)  # avoid hitting Yelp rate limits
+        time.sleep(0.5) 
 
     return restaurants
 
-# Fetch restaurants
 for cuisine in CUISINES:
     cuisine_count = 0
     print(f"Fetching {cuisine} restaurants...")
@@ -80,12 +79,12 @@ for cuisine in CUISINES:
         all_restaurants.extend(fetched)
         cuisine_count += len(fetched)
         if cuisine_count >= TARGET_PER_CUISINE:
-            break  # stop fetching more zips once target reached
+            break  
     print(f"Total unique {cuisine} restaurants fetched: {cuisine_count}")
 
-# Save all data to JSON
 with open("yelp_data_full.json", "w") as f:
     json.dump(all_restaurants, f, indent=2)
 
 print(f"Total unique restaurants fetched overall: {len(all_restaurants)}")
+
 
