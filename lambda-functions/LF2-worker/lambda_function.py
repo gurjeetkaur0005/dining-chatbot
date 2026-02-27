@@ -7,7 +7,6 @@ from datetime import datetime
 import boto3
 import urllib3
 from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Attr
 
 # ---------- Environment ----------
 TABLE_NAME = os.getenv("TABLE_NAME", "yelp-restaurants")
@@ -16,8 +15,6 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 PROCESSED_TABLE = os.getenv("PROCESSED_TABLE", "lf2-processed")
 STATE_TABLE = os.getenv("STATE_TABLE", "user-state")
 
-MAX_SCAN_ITEMS = int(os.getenv("MAX_SCAN_ITEMS", "300"))
-
 OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "restaurants")
 OS_MASTER_USER = os.getenv("OS_MASTER_USER")
@@ -25,12 +22,12 @@ OS_MASTER_PASS = os.getenv("OS_MASTER_PASS")
 
 # ---------- AWS Clients ----------
 dynamodb = boto3.resource("dynamodb")
+ddb_client = boto3.client("dynamodb")
+ses = boto3.client("ses")
+
 table = dynamodb.Table(TABLE_NAME)
 processed_table = dynamodb.Table(PROCESSED_TABLE) if PROCESSED_TABLE else None
 state_table = dynamodb.Table(STATE_TABLE) if STATE_TABLE else None
-
-ddb_client = boto3.client("dynamodb")
-ses = boto3.client("ses")
 
 http = urllib3.PoolManager(cert_reqs="CERT_REQUIRED")
 
@@ -55,6 +52,8 @@ def normalize_cuisine_variants(raw):
     return list({raw, raw.lower(), raw.upper(), raw.title()})
 
 def format_restaurants(sample):
+    if not sample:
+        return "Sorry — we couldn’t find matching restaurants right now."
     lines = []
     for i, r in enumerate(sample, 1):
         lines.append(
@@ -70,33 +69,49 @@ def already_processed(message_id: str) -> bool:
     try:
         resp = processed_table.get_item(Key={"messageId": message_id})
         return "Item" in resp
-    except ClientError:
+    except ClientError as e:
+        print(f"Dedupe get_item error: {e}")
         return False
 
 def mark_processed(message_id: str):
     if not processed_table:
         return
-    processed_table.put_item(
-        Item={
-            "messageId": message_id,
-            "processedAt": datetime.utcnow().isoformat()
-        }
-    )
+    try:
+        processed_table.put_item(
+            Item={"messageId": message_id, "processedAt": datetime.utcnow().isoformat()}
+        )
+    except ClientError as e:
+        print(f"Dedupe put_item error: {e}")
 
 def save_user_state(email: str, cuisine: str, location: str):
-    if not state_table:
+    if not state_table or not email:
         return
-    state_table.put_item(
-        Item={
-            "userId": email,
-            "lastCuisine": cuisine,
-            "lastLocation": location,
-            "updatedAt": datetime.utcnow().isoformat()
-        }
-    )
+    try:
+        state_table.put_item(
+            Item={
+                "userId": email,
+                "lastCuisine": cuisine,
+                "lastLocation": location,
+                "updatedAt": datetime.utcnow().isoformat(),
+            }
+        )
+    except ClientError as e:
+        print(f"State put_item error: {e}")
+
+def load_user_state(email: str):
+    if not state_table or not email:
+        return None
+    try:
+        resp = state_table.get_item(Key={"userId": email})
+        return resp.get("Item")
+    except ClientError as e:
+        print(f"State get_item error: {e}")
+        return None
 
 # ---------- SES ----------
 def send_email(to_email: str, subject: str, body_text: str):
+    if not SENDER_EMAIL:
+        raise RuntimeError("Missing SENDER_EMAIL env var")
     ses.send_email(
         Source=SENDER_EMAIL,
         Destination={"ToAddresses": [to_email]},
@@ -112,7 +127,10 @@ def _basic_auth_header(user, password):
     return f"Basic {token}"
 
 def os_search_ids_by_cuisine(cuisine_value, pool_size=50):
-    url = f"{OPENSEARCH_ENDPOINT}/{OPENSEARCH_INDEX}/_search"
+    if not OPENSEARCH_ENDPOINT:
+        return []
+
+    url = f"{OPENSEARCH_ENDPOINT.rstrip('/')}/{OPENSEARCH_INDEX}/_search"
 
     query = {
         "size": pool_size,
@@ -120,21 +138,31 @@ def os_search_ids_by_cuisine(cuisine_value, pool_size=50):
         "query": {"term": {"Cuisine": cuisine_value}}
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": _basic_auth_header(OS_MASTER_USER, OS_MASTER_PASS)
-    }
+    headers = {"Content-Type": "application/json"}
+    if OS_MASTER_USER and OS_MASTER_PASS:
+        headers["Authorization"] = _basic_auth_header(OS_MASTER_USER, OS_MASTER_PASS)
 
-    resp = http.request(
-        "GET", url,
-        body=json.dumps(query).encode(),
-        headers=headers
-    )
+    resp = http.request("GET", url, body=json.dumps(query).encode(), headers=headers)
 
-    data = json.loads(resp.data.decode())
+    if resp.status >= 300:
+        print(f"OpenSearch error {resp.status}: {resp.data[:200]}")
+        return []
+
+    try:
+        data = json.loads(resp.data.decode())
+    except Exception as e:
+        print(f"OpenSearch JSON parse error: {e}")
+        return []
+
     hits = data.get("hits", {}).get("hits", [])
+    ids = []
+    for h in hits:
+        src = h.get("_source") or {}
+        rid = src.get("RestaurantID")
+        if rid:
+            ids.append(rid)
 
-    return list({h["_source"]["RestaurantID"] for h in hits})
+    return list(set(ids))
 
 # ---------- DynamoDB ----------
 def ddb_batch_get_by_ids(ids):
@@ -151,40 +179,57 @@ def ddb_batch_get_by_ids(ids):
 
     result = []
     for it in items:
-        result.append({
-            "name": it["name"]["S"],
-            "address": it["address"]["S"],
-            "rating": float(it["rating"]["N"]),
-            "reviews": int(it["reviews"]["N"])
-        })
+        try:
+            result.append({
+                "name": it["name"]["S"],
+                "address": it["address"]["S"],
+                "rating": float(it["rating"]["N"]),
+                "reviews": int(it["reviews"]["N"])
+            })
+        except KeyError as e:
+            print(f"DynamoDB item missing expected field {e}. Keys: {list(it.keys())}")
+
     return result
 
 # ---------- Lambda Handler ----------
 def lambda_handler(event, context):
 
-    records = event.get("Records", [])
+    for record in event.get("Records", []):
 
-    for record in records:
         message_id = record.get("messageId", "unknown")
 
         if already_processed(message_id):
+            print(f"Skipping already processed messageId={message_id}")
             continue
 
         body = parse_record_body(record)
 
-        email = first_present(body, ["email"])
-        raw_cuisine = first_present(body, ["cuisine"], "Indian")
-        location = first_present(body, ["location"], "Manhattan")
+        email = first_present(body, ["email", "Email"])
+        if not email:
+            print(f"Missing email; cannot send recommendation. body keys={list(body.keys())}")
+            continue
 
-        date = first_present(body, ["date"], "Today")
-        time_slot = first_present(body, ["time"], "7 PM")
-        people = first_present(body, ["party_size"], "2")
 
-        is_previous = body.get("previous_search", False)
+        use_last = bool(body.get("useLastSearch", body.get("use_last_search", False)))
+
+        raw_cuisine = first_present(body, ["cuisine", "Cuisine"], "Indian")
+        location = first_present(body, ["location", "Location"], "Manhattan")
+
+        date = first_present(body, ["date", "Date"], "Today")
+        time_slot = first_present(body, ["time", "Time"], "7 PM")
+        people = first_present(body, ["party_size", "partySize", "PartySize"], "2")
+
+        # ---------- Load previous state ----------
+        if use_last:
+            st = load_user_state(email)
+            if st:
+                raw_cuisine = st.get("lastCuisine", raw_cuisine)
+                location = st.get("lastLocation", location)
+            else:
+                print("useLastSearch=true but no state found; using defaults/message values.")
 
         # ---------- Get Restaurants ----------
         restaurants = []
-
         for cv in normalize_cuisine_variants(raw_cuisine):
             ids = os_search_ids_by_cuisine(cv.title())
             if ids:
@@ -195,45 +240,51 @@ def lambda_handler(event, context):
 
         restaurant_text = format_restaurants(restaurants)
 
-        subject = f"{raw_cuisine.title()} Restaurant Recommendations"
+        cuisine_title = str(raw_cuisine).title()
+        subject = f"{cuisine_title} Restaurant Recommendations"
 
         # ---------- Email Formatting ----------
-        if is_previous:
+        if use_last:
             body_text = (
-                "Dear Guest,\n\n"
-                "Thank you for using the Dining Concierge service.\n\n"
-                "Based on your previous search, here are some recommended restaurants.\n\n"
+                "Hello,\n\n"
+                "Thanks for using the Dining Concierge service.\n\n"
+                "Based on your most recent search, here are my recommendations:\n\n"
+                f"Cuisine: {cuisine_title}\n"
                 f"Location: {location}\n\n"
-                f"Recommended {raw_cuisine.title()} Restaurants:\n"
+                f"Here are my recommendations for {cuisine_title} cuisine:\n"
                 "--------------------------------------------------\n"
                 f"{restaurant_text}\n"
                 "--------------------------------------------------\n\n"
-                "We hope you enjoy your dining experience.\n\n"
+                "Enjoy your meal!\n\n"
                 "Best regards,\n"
                 "Dining Concierge Team\n"
             )
         else:
             body_text = (
-                "Dear Guest,\n\n"
-                "Thank you for using the Dining Concierge service.\n\n"
-                "Your request details:\n"
+                "Hello,\n\n"
+                "Thanks for using the Dining Concierge service.\n\n"
+                "Here are the details of your request:\n"
                 f"Location: {location}\n"
                 f"Date: {date}\n"
                 f"Time: {time_slot}\n"
-                f"Party Size: {people}\n\n"
-                f"Recommended {raw_cuisine.title()} Restaurants:\n"
+                f"Party Size: {people}\n"
+                f"Cuisine: {cuisine_title}\n\n"
+                f"Here are my recommendations for {cuisine_title} cuisine:\n"
                 "--------------------------------------------------\n"
                 f"{restaurant_text}\n"
                 "--------------------------------------------------\n\n"
-                "We hope you enjoy your dining experience.\n\n"
+                "Enjoy your meal!\n\n"
                 "Best regards,\n"
                 "Dining Concierge Team\n"
             )
 
         # ---------- Send Email ----------
-        send_email(email, subject, body_text)
-
-        save_user_state(email, raw_cuisine.title(), location)
+        try:
+            send_email(email, subject, body_text)
+        except ClientError as e:
+            print(f"SES send_email failed: {e}")
+            continue
+        save_user_state(email, cuisine_title, location)
 
         mark_processed(message_id)
 
