@@ -1,281 +1,153 @@
-# LF2 — Dining Concierge Worker (SQS → OpenSearch/DynamoDB → SES)
+# LF2 — Suggestions Worker Lambda (SQS → OpenSearch/DynamoDB → SES)
 
-This repository contains **LF2**, the *worker Lambda* for the NYU Dining Concierge system.
+## Overview
+LF2 is the **queue worker** for the Dining Concierge application. It is triggered by **SQS (Q1)** and sends restaurant recommendations to the user via **Amazon SES**. It queries **OpenSearch** to get random restaurant IDs for a cuisine, then fetches full restaurant details from **DynamoDB**.
 
-LF2 consumes dining requests from **SQS (Q1)**, fetches restaurant IDs from **OpenSearch**, loads full restaurant details from **DynamoDB**, and sends recommendations to the user via **Amazon SES**.
-
-> ✅ **Public repo safe:** This README uses **placeholders only**. Do **NOT** commit real emails, endpoints, usernames, or passwords. Store them in **Lambda environment variables**.
-
----
-
-## Architecture Context
-
-S3 (Frontend) → API Gateway → LF0 → Lex → LF1 → **SQS (Q1)** → **LF2** → OpenSearch + DynamoDB → SES (Email)
-
-LF2 is responsible for the highlighted section.
+LF2 also supports **Extra Credit State Memory** by saving the user’s last search (**cuisine + location**) in a DynamoDB table and allowing “recommend based on last search” behavior.
 
 ---
 
-## What LF2 Does
-
+## What LF2 Does (High-Level)
 For each SQS message:
 
-1. **Dedupes** the message using a DynamoDB table (`lf2-processed`) *(optional but recommended)*.
-2. Parses the JSON payload (location/cuisine/date/time/party size/email).
-3. Queries **OpenSearch** for restaurant IDs matching the cuisine.
-4. Picks up to **3 random restaurants**.
-5. Batch-gets full details from **DynamoDB** (`yelp-restaurants`).
-6. Formats an email body and sends it via **SES**.
-7. Saves the user’s last search state to DynamoDB (`user-state`) *(optional/extra credit)*.
-8. Marks the message as processed.
+1. Reads request from SQS message body
+2. (Optional) If `useLastSearch=true`, loads last search from `user-state`
+3. Queries OpenSearch index `restaurants` for matching cuisine to get RestaurantIDs
+4. Randomly picks up to 3 RestaurantIDs
+5. Uses DynamoDB BatchGetItem on `yelp-restaurants` to fetch name/address/rating/reviews
+6. Formats email content (two formats supported)
+7. Sends email via Amazon SES
+8. Saves latest state to `user-state` (extra credit)
+9. Writes messageId to dedupe table (`lf2-processed`) to avoid reprocessing
 
 ---
 
-## Repo Structure (Suggested)
-
-```
-lambda-functions/
-  LF2/
-    lambda_function.py
-    README.md
-```
+## Architecture Flow
+SQS (Q1) → LF2 → OpenSearch (RestaurantID + Cuisine) → DynamoDB (restaurant details) → SES (email)
 
 ---
 
-## Input: SQS Message Format
+## AWS Services Used
+- AWS Lambda (LF2)
+- Amazon SQS (Q1 trigger)
+- Amazon OpenSearch Service (index `restaurants`)
+- Amazon DynamoDB (`yelp-restaurants`, `lf2-processed`, `user-state`)
+- Amazon SES (email sending)
 
-LF2 expects the **SQS message body** to be JSON.
+---
 
-### Example
+## Input Message Format (SQS)
+
+### Normal request (fresh search)
 ```json
 {
-  "email": "recipient@example.com",
-  "cuisine": "Indian",
+  "email": "gk2845@nyu.edu",
   "location": "Manhattan",
-  "date": "2026-03-01",
-  "time": "19:00",
-  "party_size": "2",
-  "previous_search": false
+  "cuisine": "Indian",
+  "date": "Today",
+  "time": "7 PM",
+  "party_size": "2"
 }
 ```
 
-### Supported Keys
-- `email` *(required)* — recipient email address
-- `cuisine` *(optional)* — defaults to `"Indian"`
-- `location` *(optional)* — defaults to `"Manhattan"`
-- `date` *(optional)* — defaults to `"Today"`
-- `time` *(optional)* — defaults to `"7 PM"`
-- `party_size` *(optional)* — defaults to `"2"`
-- `previous_search` *(optional boolean)* — changes email wording
+### Extra credit: Recommend using last search
+Send `useLastSearch` (camelCase) or `use_last_search` (snake_case):
 
-> If your LF1 uses different key names, update LF2’s parsing accordingly.
+```json
+{
+  "email": "gk2845@nyu.edu",
+  "useLastSearch": true
+}
+```
+
+LF2 will load `lastCuisine` and `lastLocation` from the `user-state` table for this email and use those values to generate recommendations.
+
+---
+
+## Email Output Formats
+
+### 1) Normal request email
+Includes request details (location/date/time/party size) + recommendations.
+
+### 2) Previous search email (`useLastSearch=true`)
+Includes “Based on your most recent search…” + cuisine/location + recommendations.
+
+---
+
+## Environment Variables
+
+| Variable | Required | Example | Description |
+|----------|----------|---------|-------------|
+| TABLE_NAME | Yes | yelp-restaurants | DynamoDB restaurants table |
+| SENDER_EMAIL | Yes | gk2845@nyu.edu | Verified SES sender email |
+| PROCESSED_TABLE | Yes | lf2-processed | DynamoDB dedupe table (messageId PK) |
+| STATE_TABLE | Yes | user-state | DynamoDB state table (userId PK) |
+| OPENSEARCH_ENDPOINT | Yes | https://search-...amazonaws.com | OpenSearch domain endpoint |
+| OPENSEARCH_INDEX | Yes | restaurants | OpenSearch index name |
+| OS_MASTER_USER | Yes* | gk2845 | Master user for basic auth |
+| OS_MASTER_PASS | Yes* | ******** | Master password |
+
+*Required if OpenSearch uses fine-grained access control (FGAC).
 
 ---
 
 ## DynamoDB Tables
 
-### 1) Restaurants Table (required)
-- **Table name:** `yelp-restaurants` *(default via `TABLE_NAME`)*
-- **Partition key:** `business_id` (String)
+### yelp-restaurants
+Stores full restaurant metadata.
+Minimum fields used by LF2:
+- business_id (Partition Key)
+- name
+- address
+- rating
+- reviews
 
-**Minimum attributes recommended per item**
-- `business_id` (String) — Yelp business id (PK)
-- `name` (String)
-- `address` (String)
-- `rating` (Number)
-- `reviews` (Number) *(or rename in code if your table uses `review_count`)*
-- `zip` (String) *(optional)*
-- `cuisine` (String) *(recommended for fallback/querying)*
-- `insertedAtTimestamp` (String)
+### lf2-processed (dedupe)
+Prevents processing same SQS message multiple times.
+- Partition Key: messageId (String)
+- processedAt (ISO timestamp)
 
-LF2 currently batch-reads these attributes:
-- `name`, `address`, `rating`, `reviews`
-
-So make sure those fields exist in DynamoDB (or adjust `ddb_batch_get_by_ids()`).
-
-### 2) Processed Messages Table (optional, recommended)
-- **Table name:** `lf2-processed` *(default via `PROCESSED_TABLE`)*
-- **Partition key:** `messageId` (String)
-
-Used to avoid duplicate emails when Lambda retries.
-
-### 3) State Memory Table (optional / extra credit)
-- **Table name:** `user-state` *(default via `STATE_TABLE`)*
-- **Partition key:** `userId` (String)
-
-Stores:
-- `lastCuisine`, `lastLocation`, `updatedAt`
+### user-state (extra credit)
+Stores last search per user.
+- Partition Key: userId (String) = user email
+- lastCuisine
+- lastLocation
+- updatedAt
 
 ---
 
-## OpenSearch Setup (Create LAST — Cost Risk)
+## Triggers
+- Primary: SQS Q1 trigger (recommended)
+- Optional: EventBridge schedule (if used, ensure it does not conflict with SQS trigger)
 
-- **Endpoint:** set via `OPENSEARCH_ENDPOINT`
-- **Index:** `restaurants` *(default via `OPENSEARCH_INDEX`)*
+---
 
-LF2 queries by cuisine using:
-- `term` query on field `Cuisine`
-- returns `_source.RestaurantID`
+## Testing
 
-### Expected Document Shape
-```json
-{
-  "RestaurantID": "some-yelp-business-id",
-  "Cuisine": "Indian"
-}
+### Option A — Send a message to Q1 (recommended)
+SQS → Q1 → Send message → paste JSON body from the examples above.
+
+Then verify:
+- LF2 CloudWatch logs show execution
+- Email arrives via SES
+
+### Option B — Lambda test event
+You can also test LF2 using an SQS-style test event with Records, but SQS console test is simplest.
+
+---
+
+## Notes / Expected Behavior
+- Recommendations will vary each run because restaurants are randomly selected.
+- If OpenSearch fails or returns empty, recommendations may be empty.
+- State memory saves only cuisine + location (meets extra credit requirement).
+
+---
+
+## Folder Contents
 ```
-
-> **Important:** `term` queries are case-sensitive depending on mapping. Keep cuisine values consistent (e.g., Title Case) or use a keyword field.
-
-### Auth
-This implementation uses **Basic Auth** via:
-- `OS_MASTER_USER`
-- `OS_MASTER_PASS`
-
-If your domain uses IAM SigV4 instead, you must replace the OpenSearch request signing logic.
-
----
-
-## Environment Variables (Lambda Configuration)
-
-Set these in **AWS Lambda → Configuration → Environment variables**.
-
-| Variable | Example (placeholder) | Required | Notes |
-|---|---|---:|---|
-| `TABLE_NAME` | `yelp-restaurants` | ✅ | Restaurants DynamoDB table |
-| `SENDER_EMAIL` | `verified-sender@example.com` | ✅ | Must be verified in SES |
-| `PROCESSED_TABLE` | `lf2-processed` | Optional | Dedupe table |
-| `STATE_TABLE` | `user-state` | Optional | State memory table |
-| `MAX_SCAN_ITEMS` | `300` | Optional | Reserved for fallback patterns |
-| `OPENSEARCH_ENDPOINT` | `https://search-xxxx.us-east-1.es.amazonaws.com` | ✅* | Required if using OpenSearch |
-| `OPENSEARCH_INDEX` | `restaurants` | Optional | Default: `restaurants` |
-| `OS_MASTER_USER` | `admin` | ✅* | Required if using Basic Auth |
-| `OS_MASTER_PASS` | `change-me` | ✅* | Required if using Basic Auth |
-
-\* Required only if you are using OpenSearch in LF2.
-
----
-
-## IAM Permissions (LF2 Execution Role)
-
-Attach permissions for:
-
-### SQS (needed when triggered by SQS)
-- `sqs:ReceiveMessage`
-- `sqs:DeleteMessage`
-- `sqs:GetQueueAttributes`
-- `sqs:ChangeMessageVisibility`
-
-### DynamoDB (required)
-- `dynamodb:GetItem`
-- `dynamodb:BatchGetItem`
-- `dynamodb:PutItem` *(for processed/state tables)*
-- `dynamodb:UpdateItem` *(optional)*
-- `dynamodb:Query` *(optional)*
-- `dynamodb:Scan` *(optional; avoid in production)*
-
-### SES (required)
-- `ses:SendEmail`
-- `ses:SendRawEmail`
-
-### OpenSearch (required if using OpenSearch)
-- `es:ESHttpGet`
-- `es:ESHttpPost`
-
-> Best practice: scope resources to your specific Queue ARN, Table ARNs, SES identity, and OpenSearch domain.
-
----
-
-## SES Notes (Common Gotcha)
-
-If SES is in **Sandbox**:
-- The **sender** must be verified.
-- The **recipient** must also be verified.
-
-Move out of sandbox if your class allows it; otherwise verify both emails.
-
----
-
-## Deploy & Test
-
-### 1) Upload code
-Upload `lambda_function.py` to the LF2 Lambda.
-
-### 2) Configure trigger
-Add **SQS trigger** to LF2:
-- queue: `Q1`
-
-### 3) Send a test message to Q1
-Use SQS Console → *Send and receive messages*:
-
-```json
-{"email":"recipient@example.com","cuisine":"Chinese","location":"Manhattan","date":"Today","time":"7 PM","party_size":"4"}
+LF2-worker/
+├── lambda_function.py
+├── requirements.txt
+├── scheduler.md
+└── README.md
 ```
-
-### 4) Verify logs
-Check **CloudWatch Logs** for:
-- message parsed
-- OpenSearch hits returned
-- DynamoDB batch-get results
-- SES send success
-
----
-
-## Public Repo Safety Checklist ✅
-
-- [ ] No real `SENDER_EMAIL` committed
-- [ ] No `OPENSEARCH_ENDPOINT` committed
-- [ ] No `OS_MASTER_USER/OS_MASTER_PASS` committed
-- [ ] `.env` is gitignored
-- [ ] README uses placeholders only
-
-### Recommended Files
-
-Create `.env.example` (safe to commit):
-```env
-TABLE_NAME=yelp-restaurants
-SENDER_EMAIL=verified-sender@example.com
-PROCESSED_TABLE=lf2-processed
-STATE_TABLE=user-state
-OPENSEARCH_ENDPOINT=https://search-xxxx.us-east-1.es.amazonaws.com
-OPENSEARCH_INDEX=restaurants
-OS_MASTER_USER=admin
-OS_MASTER_PASS=change-me
-```
-
-Add to `.gitignore`:
-```gitignore
-.env
-*.pem
-*.key
-```
-
----
-
-## Troubleshooting
-
-### “Email address not verified”
-- Verify sender in SES
-- If sandbox, verify recipient too
-
-### SQS trigger not firing
-- Confirm trigger is attached to LF2
-- Confirm LF2 role has SQS permissions
-- Confirm messages are visible (not stuck due to visibility timeout)
-
-### OpenSearch errors (401/403)
-- Check endpoint starts with `https://`
-- Check Basic Auth vars are set
-- Ensure OpenSearch security is configured to allow that user
-- Confirm index name matches `OPENSEARCH_INDEX`
-
-### DynamoDB KeyError (missing fields)
-If you see KeyError for `name/address/rating/reviews`, your table schema differs.
-Update `ddb_batch_get_by_ids()` to match your stored attribute names.
-
----
-
-## Cost Note (Important)
-
-**Create OpenSearch LAST** and delete it after the demo to avoid ongoing charges.
-Use minimal settings (single node, dev/test, single AZ) per assignment guidance.
