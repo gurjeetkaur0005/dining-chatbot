@@ -1,148 +1,163 @@
-# LF3 — Scheduler / Trigger Lambda (EventBridge → SQS/LF2)
+# LF3 — Last Search Recommendation Trigger (State → SQS)
 
-This repository contains **LF3**, the *scheduler/trigger Lambda* for the NYU Dining Concierge system.
+## Overview
+LF3 implements the **Extra Credit: State Memory** feature for the Dining Concierge application.
 
-LF3 is designed to run on a fixed interval (typically **every 1 minute**) using **Amazon EventBridge Scheduler** (or EventBridge rule). Its job is to **kick off background processing** reliably without relying on user traffic.
+It retrieves a user's **last search (cuisine + location)** from a DynamoDB table (`user-state`) and sends a request to the SQS queue (Q1). The worker Lambda (LF2) then generates recommendations based on that saved state and emails them to the user.
 
-> ✅ **Public repo safe:** This README uses **placeholders only**. Do **NOT** commit real AWS endpoints, emails, usernames, passwords, or account-specific ARNs.
-
----
-
-## Where LF3 Fits in the Architecture
-
-S3 (Frontend) → API Gateway → LF0 → Lex → LF1 → SQS(Q1) → LF2 → OpenSearch + DynamoDB → SES
-
-LF3 is **out-of-band** and supports the worker pipeline by triggering processing on a schedule.
-
-**Typical patterns used in class projects:**
-
-### Pattern A (Recommended): LF3 triggers LF2 (direct invoke)
-EventBridge Scheduler → **LF3** → Invoke **LF2**
-- LF2 still reads from SQS and processes messages
-- LF3 does *not* touch restaurant data
-
-### Pattern B: LF3 polls SQS (lightweight) and invokes LF2 only if needed
-EventBridge Scheduler → **LF3** → Check `ApproximateNumberOfMessages` on Q1 → Invoke LF2 if > 0
-
-### Pattern C: LF3 replays requests (extra credit / state memory)
-EventBridge Scheduler → **LF3** → Read `user-state` DynamoDB → Send “previous search” message(s) into Q1
-
-> Your team should pick **one** pattern and keep it simple. Most graders are happy with Pattern A or B.
+LF3 itself does NOT query OpenSearch or send email — it only triggers the recommendation workflow.
 
 ---
 
-## What LF3 Does (Default Implementation)
-
-When triggered by EventBridge:
-
-1. Optionally checks whether Q1 has messages waiting (Pattern B).
-2. Invokes LF2 (async) so LF2 can process queued requests.
-3. Returns 200 to EventBridge.
-
-LF3 should be **small** and **cheap**.
+## What LF3 Does (High-Level)
+1. Accepts a request containing `userId` or `email`
+2. Reads last search from DynamoDB table `user-state`
+3. Builds a payload with `useLastSearch = true`
+4. Sends the payload to SQS queue Q1
+5. Returns a confirmation response
 
 ---
 
-## Repo Structure (Suggested)
+## Architecture Flow
+Client → LF3 → DynamoDB (`user-state`) → SQS (Q1) → LF2 → OpenSearch + DynamoDB → SES (email)
 
-```
-lambda-functions/
-  LF3/
-    lambda_function.py
-    README.md
+---
+
+## AWS Services Used
+- AWS Lambda (LF3)
+- Amazon DynamoDB (`user-state` table)
+- Amazon SQS (Q1 queue)
+
+---
+
+## Input Event Format
+
+LF3 accepts either `userId` or `email`:
+
+```json
+{
+  "email": "gk2845@nyu.edu"
+}
 ```
 
+or
+
+```json
+{
+  "userId": "gk2845@nyu.edu"
+}
+```
+
+The value must match the partition key stored in the `user-state` table.
+
 ---
 
-## EventBridge Scheduler Setup
+## Output Response
 
-### Schedule
-- Frequency: **every 1 minute**
+Successful request:
 
-Example (EventBridge rule style):
-- Rate expression: `rate(1 minute)`
+```json
+{
+  "sentToQueue": true,
+  "message": "Last-search recommendation request sent to queue"
+}
+```
 
-EventBridge Scheduler (new UI) is also fine.
+If no saved state exists:
 
-### Target
-- Target: **LF3 Lambda ARN**
-- Payload: optional (can be `{}`)
+```json
+"No saved state found for this user"
+```
+
+---
+
+## Payload Sent to SQS (Q1)
+
+LF3 sends this message to Q1 for LF2 to process:
+
+```json
+{
+  "email": "gk2845@nyu.edu",
+  "useLastSearch": true,
+  "location": "Manhattan",
+  "cuisine": "Indian"
+}
+```
+
+LF2 uses `useLastSearch=true` to load the latest state and generate recommendations.
 
 ---
 
 ## Environment Variables
 
-Set these in **AWS Lambda → Configuration → Environment variables**.
-
-| Variable | Example (placeholder) | Required | Notes |
-|---|---|---:|---|
-| `QUEUE_URL` | `https://sqs.us-east-1.amazonaws.com/123456789012/Q1` | Optional | Needed for Pattern B/C |
-| `LF2_FUNCTION_NAME` | `LF2` | Optional | Needed for Pattern A/B |
-| `STATE_TABLE` | `user-state` | Optional | Needed for Pattern C |
-| `AWS_REGION` | `us-east-1` | Optional | Defaults to Lambda region |
-
-> Keep environment variables **as placeholders in the repo**. Real values go only in AWS.
+| Variable | Required | Example | Description |
+|----------|----------|---------|-------------|
+| STATE_TABLE | Yes | user-state | DynamoDB table storing last searches |
+| QUEUE_URL | Yes | https://sqs.../Q1 | URL of SQS queue Q1 |
 
 ---
 
-## IAM Permissions (LF3 Execution Role)
+## DynamoDB Table: user-state
 
-Choose permissions based on your chosen pattern.
+Partition Key: `userId` (String) — typically the user's email
 
-### Pattern A — Invoke LF2 only
-- `lambda:InvokeFunction` on LF2
+Example item:
 
-### Pattern B — Check SQS and invoke LF2
-- `sqs:GetQueueAttributes` on Q1
-- `lambda:InvokeFunction` on LF2
+```json
+{
+  "userId": "gk2845@nyu.edu",
+  "lastCuisine": "Indian",
+  "lastLocation": "Manhattan",
+  "updatedAt": "2026-02-27T02:12:36Z"
+}
+```
 
-### Pattern C — Read state and enqueue messages
-- `dynamodb:Scan` or `dynamodb:Query` on `user-state`
+---
+
+## IAM Permissions Required
+
+LF3 execution role must allow:
+
+### DynamoDB
+- `dynamodb:GetItem` on `user-state`
+
+### SQS
 - `sqs:SendMessage` on Q1
-- (optional) `lambda:InvokeFunction` on LF2
-
-> Best practice: scope resources to the specific LF2 ARN / Queue ARN / Table ARN.
 
 ---
 
 ## Testing
 
-### 1) Manual test invoke in Lambda console
-- Create a test event:
+### Lambda Console Test Event
+
 ```json
-{}
+{
+  "email": "gk2845@nyu.edu"
+}
 ```
-- Run LF3
-- Confirm in CloudWatch logs that it:
-  - invoked LF2, or
-  - checked Q1 and invoked LF2 when messages exist
 
-### 2) End-to-end
-- Send an SQS message into Q1 (from LF1 or manual)
-- Wait for scheduler tick (1 minute)
-- Confirm LF2 runs and sends email
+Then verify:
+
+- LF3 returns success response
+- Message appears in SQS Q1
+- LF2 processes message
+- Recommendation email is received
 
 ---
 
-## Common Issues & Fixes
+## Notes
 
-### “AccessDeniedException” when invoking LF2
-- Add `lambda:InvokeFunction` permission to LF3 role for the LF2 ARN
-
-### Scheduler is not firing
-- Confirm EventBridge schedule is **Enabled**
-- Confirm correct target Lambda selected
-- Check EventBridge “Invocations” and “FailedInvocations” metrics
-
-### LF3 runs but LF2 doesn’t process messages
-- Ensure LF2 has SQS trigger attached *or* LF2 code reads from SQS when invoked
-- Confirm Q1 has messages and they are visible (not in-flight)
+- LF3 only triggers recommendations; it does not generate them.
+- The email content and restaurant selection are handled entirely by LF2.
+- This design keeps the recommendation system modular and decoupled from the chatbot.
 
 ---
 
-## Public Repo Safety Checklist ✅
+## Folder Contents
 
-- [ ] No real `QUEUE_URL` committed
-- [ ] No real Lambda ARNs committed
-- [ ] No account IDs committed
-- [ ] README uses placeholders only
+```
+LF3-state/
+├── lambda_function.py
+├── requirements.txt
+└── README.md
+```
