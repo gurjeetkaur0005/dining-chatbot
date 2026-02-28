@@ -242,7 +242,8 @@ This project demonstrates:
 
 ## 👩‍💻 Author
 
-**Gurjit Kaur**  
+**Vandana Rawat**
+**Gurjeet Kaur**  
 NYU Tandon School of Engineering  
 Master’s in Computer Science
 
