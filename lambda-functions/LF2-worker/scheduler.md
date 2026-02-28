@@ -1,37 +1,45 @@
-# LF2 Scheduler Configuration
-
-## Overview
-
-LF2 is a background worker Lambda that processes dining requests from the SQS queue (Q1).  
-It is triggered automatically using Amazon EventBridge on a fixed schedule.
-
-## Schedule
-
-- Service: Amazon EventBridge (CloudWatch Events)
-- Trigger Type: Scheduled rule
-- Expression: `rate(1 minute)`
-- State: Enabled
+# EventBridge Scheduler (LF2 Worker)
 
 ## Purpose
+Run **LF2** automatically every minute so it can poll **SQS (Q1)** and process restaurant suggestion requests without manual invocation.
 
-Each invocation:
+## Schedule
+- Service: **Amazon EventBridge Scheduler**
+- Schedule type: **Rate-based**
+- Expression: `rate(1 minute)`
+- State: **Enabled**
+- Action after completion: **NONE**
 
-1. Polls the SQS queue (Q1)
-2. Processes pending requests
-3. Sends restaurant recommendations via SES
-4. Deletes processed messages
-5. Exits if no messages are available
+## Target
+- Target API: **AWS Lambda → Invoke**
+- Target function: **LF2**
+- Input (payload):
+```json
+{ "source": "scheduler", "job": "poll-q1" }
+```
 
-## Configuration Steps
+## Retry Policy
+- Retry: **Enabled**
+- Maximum event age: **5 minutes**
+- Retry attempts: **2**
 
-1. Open AWS Console → EventBridge → Rules
-2. Create a new rule (Schedule)
-3. Choose rate-based schedule: 1 minute
-4. Set target as the LF2 Lambda function
-5. Enable the rule
+## Dead-Letter Queue (DLQ) (Recommended)
+- DLQ Type: **Standard SQS queue**
+- DLQ Name: `lf2-scheduler-dlq`
+- Purpose: Stores failed invocations if Scheduler cannot deliver to LF2.
 
-## Notes
+> Note: Do **NOT** use the main request queue **Q1** as the DLQ.
 
-- Enables asynchronous processing independent of the chatbot
-- Requires permission to invoke Lambda (`lambda:InvokeFunction`)
-- Execution and errors can be monitored via CloudWatch Logs
+## Permissions
+- Execution role: **Create new role for this schedule**
+- Required permission:
+  - `lambda:InvokeFunction` on LF2
+
+## Verification
+1. **Lambda → LF2 → Monitor**
+   - Invocations increase approximately **1 per minute**
+   - Success rate ~ **100%**
+2. **CloudWatch Logs**
+   - Log entries show repeated `START RequestId` events every minute.
+3. **SQS Q1**
+   - Messages decrease to **0** after LF2 processes and deletes them (no duplicates).
