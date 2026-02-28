@@ -14,6 +14,33 @@ sqs = boto3.client("sqs", region_name=SQS_REGION)
 
 ALLOWED_LOCATION = "Manhattan"
 
+# ==============================
+# CUISINE VALIDATION
+# ==============================
+
+# Exact allowed cuisines (normalized to lowercase)
+ALLOWED_CUISINES = [
+    "italian",
+    "chinese",
+    "mexican",
+    "indian",
+    "japanese",
+    "thai",
+    "korean",
+    "french",
+    "mediterranean",
+    "american"
+]
+
+def normalize_text(s: str) -> str:
+    """Lowercase + strip + collapse internal whitespace."""
+    if s is None:
+        return ""
+    return " ".join(s.strip().lower().split())
+
+def cuisine_display_list() -> str:
+    """Pretty list for user messages."""
+    return ", ".join([c.title() for c in ALLOWED_CUISINES])
 
 # ==============================
 # HELPERS
@@ -124,6 +151,30 @@ def lambda_handler(event, context):
     location = get_slot_value(event, "Location")
     cuisine = get_slot_value(event, "Cuisine")
     date = get_slot_value(event, "Date")
+    time = get_slot_value(event, "Time")
+    party_size = get_slot_value(event, "PartySize")
+    email = get_slot_value(event, "Email")
+
+    # Enforce Manhattan only
+    if location:
+        normalized_location = normalize_text(location)
+        if normalized_location != normalize_text(ALLOWED_LOCATION):
+            return elicit_slot(
+                event,
+                "Location",
+                "Please enter a valid location. Currently, only Manhattan is supported."
+            )
+
+    # ✅ Enforce allowed cuisines only
+    if cuisine:
+        normalized_cuisine = normalize_text(cuisine)
+        if normalized_cuisine not in ALLOWED_CUISINES:
+            return elicit_slot(
+                event,
+                "Cuisine",
+                f"Please select cuisine only from: {cuisine_display_list()}."
+            )
+
     # Reject past dates (e.g., yesterday)
     if date:
         try:
@@ -142,19 +193,6 @@ def lambda_handler(event, context):
                 "Date",
                 "Invalid date format. Please enter a valid date."
             )
-    time = get_slot_value(event, "Time")
-    party_size = get_slot_value(event, "PartySize")
-    email = get_slot_value(event, "Email")
-
-    # Enforce Manhattan only
-    if location:
-        normalized_location = location.strip().lower()
-        if normalized_location != ALLOWED_LOCATION.lower():
-            return elicit_slot(
-                event,
-                "Location",
-                "Please enter a valid location. Currently, only Manhattan is supported."
-            )
 
     # Guard against early fulfillment
     required_slots = [
@@ -169,6 +207,14 @@ def lambda_handler(event, context):
     missing = [slot_name for slot_name, value in required_slots if not value]
 
     if missing:
+        # Better UX when Cuisine missing
+        if missing[0] == "Cuisine":
+            return elicit_slot(
+                event,
+                "Cuisine",
+                f"Please select a cuisine from: {cuisine_display_list()}."
+            )
+
         return elicit_slot(
             event,
             missing[0],
