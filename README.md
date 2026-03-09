@@ -11,7 +11,7 @@ The system demonstrates an end‑to‑end event‑driven architecture integratin
 
 ## ✨ Key Features
 
-- Conversational chatbot interface (Amazon Lex V2)
+- Conversational chatbot interface (Amazon Lex )
 - Restaurant recommendations for Manhattan by cuisine
 - Email delivery of suggestions via Amazon SES
 - Event‑driven processing using SQS queues
