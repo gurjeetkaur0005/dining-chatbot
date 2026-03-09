@@ -84,7 +84,7 @@ This separation enables efficient search while retaining full metadata.
 ### 2) Lex Proxy Lambda
 
 - Receives requests from API Gateway
-- Forwards text to Amazon Lex V2
+- Forwards text to Amazon Lex 
 - Returns chatbot responses to frontend
 - Maintains session using client IP hash
 
