@@ -28,7 +28,7 @@ The system demonstrates an end‑to‑end event‑driven architecture integratin
 Frontend (S3 Website)  
 → API Gateway  
 → Lex Proxy Lambda  
-→ Amazon Lex V2  
+→ Amazon Lex  
 → Fulfillment Lambda  
 → SQS (Q1)  
 → Worker Lambda (LF2)  
@@ -47,7 +47,7 @@ LF3 State Trigger → DynamoDB (user-state) → SQS → LF2
 | Amazon S3 | Static website hosting |
 | API Gateway | HTTP endpoint for chatbot |
 | AWS Lambda | Backend compute (multiple functions) |
-| Amazon Lex V2 | Natural language chatbot |
+| Amazon Lex | Natural language chatbot |
 | Amazon SQS | Asynchronous message queue |
 | Amazon DynamoDB | Restaurant data + state storage |
 | Amazon OpenSearch | Fast cuisine‑based search |
