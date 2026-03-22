@@ -8,8 +8,8 @@ OPENSEARCH_ENDPOINT = "https://search-domain1-6ikn37etifnsbylwp627rmwiy4.us-east
 INDEX = "restaurants"
 
 # IMPORTANT: Fill these with your OpenSearch MASTER user credentials
-MASTER_USER = "gk2845"
-MASTER_PASS = "Jashansaini@2001"
+MASTER_USER = "hk3677"
+MASTER_PASS = "wwwww"
 
 MAX_DOCS = 1000        # 1000 is sufficient
 BATCH_SIZE = 200       # safe bulk size
