@@ -3,17 +3,14 @@ import random
 import requests
 from requests.auth import HTTPBasicAuth
 
-# ---------------- CONFIG ----------------
 OPENSEARCH_ENDPOINT = "https://search-domain1-6ikn37etifnsbylwp627rmwiy4.us-east-1.es.amazonaws.com"
 INDEX = "restaurants"
 
-# IMPORTANT: Fill these with your OpenSearch MASTER user credentials
 MASTER_USER = "hk3677"
 MASTER_PASS = "wwwww"
 
-MAX_DOCS = 1000        # 1000 is sufficient
-BATCH_SIZE = 200       # safe bulk size
-# ----------------------------------------
+MAX_DOCS = 1000       
+BATCH_SIZE = 200      
 
 auth = HTTPBasicAuth(MASTER_USER, MASTER_PASS)
 headers = {"Content-Type": "application/x-ndjson"}
@@ -43,7 +40,6 @@ def bulk_send(batch):
 
     out = resp.json()
     if out.get("errors"):
-        # print the first error to help debug
         for item in out.get("items", []):
             action = item.get("index", {})
             if "error" in action:
@@ -54,13 +50,12 @@ def bulk_send(batch):
 
 
 def main():
-    # Load data
+
     with open("yelp_data_full.json", "r") as f:
         data = json.load(f)
 
     random.shuffle(data)
 
-    # Pick MAX_DOCS unique business_id entries
     picked = []
     seen = set()
     for r in data:
@@ -75,7 +70,7 @@ def main():
     if not picked:
         raise RuntimeError("No restaurants found in yelp_data_full.json")
 
-    # Bulk upload in batches
+    
     total = 0
     for i in range(0, len(picked), BATCH_SIZE):
         batch = picked[i:i + BATCH_SIZE]
